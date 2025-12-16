@@ -6,6 +6,7 @@ from .video_cinematic_processor import (
     VideoCinematicProcessor,
     VideoFrameExtractor,
     VideoFrameComposer,
+    GMFSSModelLoader,
     FrameInterpolator,
 )
 
@@ -14,5 +15,6 @@ __all__ = [
     'VideoCinematicProcessor',
     'VideoFrameExtractor',
     'VideoFrameComposer',
+    'GMFSSModelLoader',
     'FrameInterpolator',
 ]

@@ -7,6 +7,7 @@ from .nodes.video_cinematic_processor import (
     VideoCinematicProcessor,
     VideoFrameExtractor,
     VideoFrameComposer,
+    GMFSSModelLoader,
     FrameInterpolator,
 )
 
@@ -15,6 +16,7 @@ NODE_CLASS_MAPPINGS = {
     "VideoCinematicProcessor": VideoCinematicProcessor,
     "VideoFrameExtractor": VideoFrameExtractor,
     "VideoFrameComposer": VideoFrameComposer,
+    "GMFSSModelLoader": GMFSSModelLoader,
     "FrameInterpolator": FrameInterpolator,
 }
 
@@ -23,6 +25,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoCinematicProcessor": "🎬 Video Cinematic Processor",
     "VideoFrameExtractor": "📽️ Video Frame Extractor",
     "VideoFrameComposer": "🎥 Video Frame Composer",
+    "GMFSSModelLoader": "🔄 GMFSS Model Loader",
     "FrameInterpolator": "⏩ Frame Interpolator",
 }
 

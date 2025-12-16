@@ -67,15 +67,41 @@
 
 ---
 
+### 🔄 GMFSS Model Loader
+GMFSS 视频补帧模型加载器
+
+**参数：**
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| model_path | STRING | "" | GMFSS模型路径 (.pkl文件) |
+| model_type | ENUM | union | 模型类型 (gmfss/union) |
+| scale | FLOAT | 1.0 | 光流计算分辨率缩放 (0.25-2.0) |
+
+**输出：** model (VFI_MODEL)
+
+**模型下载：**
+- [GMFSS模型](https://drive.google.com/file/d/1BKz8UDAPEt713IVUSZSpzpfz_Fi2Tfd_/view)
+- [Union模型 (推荐)](https://drive.google.com/file/d/1Mvd1GxkWf-DpfE9OPOtqRM9KNk20kLP3/view)
+
+将模型放置到 `ComfyUI/models/vfi/` 目录。
+
+---
+
 ### ⏩ Frame Interpolator
-独立补帧节点 (RIFE光流)
+通用补帧节点 - 支持 GMFSS / RIFE / 线性插值
 
 **参数：**
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
 | frames | IMAGE | - | 帧序列 |
 | multiplier | ENUM | 2x | 补帧倍数 (2x/4x/8x) |
-| use_rife | BOOL | True | 使用RIFE光流 |
+| vfi_model | VFI_MODEL | - | 可选，来自GMFSS Model Loader |
+| fallback_mode | ENUM | linear | 无模型时的回退模式 (linear/rife) |
+
+**使用方式：**
+1. **使用GMFSS (推荐):** GMFSSModelLoader → FrameInterpolator
+2. **使用RIFE:** FrameInterpolator (fallback_mode=rife)
+3. **线性插值 (快速):** FrameInterpolator (fallback_mode=linear)
 
 ---
 
@@ -93,7 +119,8 @@ git clone https://github.com/None9527/ComfyUI-None-upup.git
 - PyTorch (支持BF16)
 - OpenCV (`pip install opencv-python`)
 - FFmpeg (系统安装，用于视频处理)
-- RIFE模型 (可选，用于光流补帧)
+- GMFSS_Fortuna (可选，推荐用于高质量光流补帧)
+- RIFE模型 (可选，作为GMFSS的备选)
 
 ## License
 

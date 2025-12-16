@@ -619,18 +619,99 @@ class VideoFrameComposer:
             return None
 
 
+class GMFSSModelLoader:
+    """
+    GMFSS 模型加载器
+    支持 GMFSS_Fortuna 系列模型 (gmfss / union)
+    """
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "model_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "GMFSS模型路径 (.pkl文件)"
+                }),
+                "model_type": (["gmfss", "union"], {
+                    "default": "union",
+                    "tooltip": "模型类型：gmfss基础版 / union增强版"
+                }),
+            },
+            "optional": {
+                "scale": ("FLOAT", {
+                    "default": 1.0,
+                    "min": 0.25,
+                    "max": 2.0,
+                    "step": 0.25,
+                    "tooltip": "光流计算分辨率缩放 (越小越快，质量降低)"
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("VFI_MODEL",)
+    RETURN_NAMES = ("model",)
+    FUNCTION = "load_model"
+    CATEGORY = "None-upup"
+
+    def load_model(self, model_path: str, model_type: str = "union", scale: float = 1.0):
+        """加载GMFSS模型"""
+        import importlib.util
+        
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        
+        # 尝试从models目录加载
+        if not model_path:
+            models_dir = os.path.join(folder_paths.models_dir, "vfi")
+            if model_type == "union":
+                model_path = os.path.join(models_dir, "GMFSS_union.pkl")
+            else:
+                model_path = os.path.join(models_dir, "GMFSS.pkl")
+        
+        if not os.path.exists(model_path):
+            raise FileNotFoundError(f"GMFSS模型未找到: {model_path}\n请下载模型并放置到 models/vfi/ 目录")
+        
+        # 加载模型
+        model_data = {
+            "type": "gmfss",
+            "model_type": model_type,
+            "model_path": model_path,
+            "scale": scale,
+            "device": device,
+            "dtype": dtype,
+            "model": None,  # 延迟加载
+        }
+        
+        print(f"[GMFSSModelLoader] 模型配置完成: {model_type}, scale={scale}")
+        
+        return (model_data,)
+
+
 class FrameInterpolator:
-    """独立补帧节点"""
+    """
+    通用补帧节点
+    支持 GMFSS / RIFE 模型，或使用线性插值
+    """
     
     @classmethod
     def INPUT_TYPES(cls):
         return {
             "required": {
                 "frames": ("IMAGE",),
-                "multiplier": (["2x", "4x", "8x"], {"default": "2x"}),
+                "multiplier": (["2x", "4x", "8x"], {
+                    "default": "2x",
+                    "tooltip": "补帧倍数"
+                }),
             },
             "optional": {
-                "use_rife": ("BOOLEAN", {"default": True, "tooltip": "使用RIFE光流补帧"}),
+                "vfi_model": ("VFI_MODEL", {
+                    "tooltip": "视频补帧模型 (来自GMFSSModelLoader)"
+                }),
+                "fallback_mode": (["linear", "rife"], {
+                    "default": "linear",
+                    "tooltip": "无模型时的回退模式"
+                }),
             },
         }
 
@@ -642,19 +723,156 @@ class FrameInterpolator:
     def __init__(self):
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+        self._gmfss_model = None
+        self._gmfss_config = None
 
-    def interpolate(self, frames, multiplier, use_rife=True):
+    def interpolate(self, frames, multiplier, vfi_model=None, fallback_mode="linear"):
         mult = {"2x": 2, "4x": 4, "8x": 8}[multiplier]
         
-        if use_rife:
+        if vfi_model is not None:
+            if vfi_model.get("type") == "gmfss":
+                result = self._gmfss_interpolate(frames, mult, vfi_model)
+            else:
+                result = self._model_interpolate(frames, mult, vfi_model)
+        elif fallback_mode == "rife":
             result = self._rife_interpolate(frames, mult)
         else:
             result = self._linear_interpolate(frames, mult)
         
         return (result,)
 
+    def _gmfss_interpolate(self, frames: torch.Tensor, mult: int, config: dict) -> torch.Tensor:
+        """GMFSS光流补帧"""
+        N, H, W, C = frames.shape
+        scale = config.get("scale", 1.0)
+        device = config.get("device", self.device)
+        dtype = config.get("dtype", self.dtype)
+        model_path = config.get("model_path")
+        model_type = config.get("model_type", "union")
+        
+        # 延迟加载模型
+        if self._gmfss_model is None or self._gmfss_config != model_path:
+            self._gmfss_model = self._load_gmfss(model_path, model_type, device)
+            self._gmfss_config = model_path
+        
+        if self._gmfss_model is None:
+            print("[FrameInterpolator] GMFSS加载失败，回退到线性插值")
+            return self._linear_interpolate(frames, mult)
+        
+        # 转换格式 [N, C, H, W] 并归一化
+        frames_gpu = frames.permute(0, 3, 1, 2).to(device, dtype=dtype)
+        
+        # 确保尺寸可被32整除 (GMFSS要求)
+        ph = ((H - 1) // 32 + 1) * 32
+        pw = ((W - 1) // 32 + 1) * 32
+        padding = (0, pw - W, 0, ph - H)
+        frames_padded = F.pad(frames_gpu, padding, mode='replicate')
+        
+        interpolated = []
+        
+        for i in range(N - 1):
+            f0 = frames_padded[i:i+1]
+            f1 = frames_padded[i+1:i+2]
+            
+            interpolated.append(f0[:, :, :H, :W].cpu())
+            
+            # 生成中间帧
+            for t_idx in range(1, mult):
+                timestep = t_idx / mult
+                with torch.no_grad():
+                    # GMFSS接口: inference(img0, img1, timestep, scale)
+                    mid = self._gmfss_model.inference(f0, f1, timestep, scale)
+                    mid = mid[:, :, :H, :W]  # 裁剪回原尺寸
+                interpolated.append(mid.cpu())
+            
+            # 定期清理显存
+            if i % 10 == 0:
+                torch.cuda.empty_cache()
+        
+        # 添加最后一帧
+        interpolated.append(frames_padded[-1:, :, :H, :W].cpu())
+        
+        # 合并结果
+        result = torch.cat(interpolated, dim=0)
+        result = result.permute(0, 2, 3, 1).to(torch.float32)
+        return torch.clamp(result, 0, 1)
+
+    def _load_gmfss(self, model_path: str, model_type: str, device):
+        """加载GMFSS模型"""
+        try:
+            # 尝试加载本地GMFSS实现
+            gmfss_dir = os.path.dirname(model_path)
+            
+            # 动态导入模型
+            if model_type == "union":
+                # Union模型
+                try:
+                    from model.GMFSS_union import Model
+                except ImportError:
+                    # 尝试从ComfyUI插件加载
+                    try:
+                        from custom_nodes.ComfyUI_VFI.gmfss_union import Model
+                    except ImportError:
+                        Model = self._create_gmfss_wrapper()
+            else:
+                # 基础GMFSS模型
+                try:
+                    from model.GMFSS import Model
+                except ImportError:
+                    try:
+                        from custom_nodes.ComfyUI_VFI.gmfss import Model
+                    except ImportError:
+                        Model = self._create_gmfss_wrapper()
+            
+            if Model is None:
+                return None
+            
+            model = Model()
+            model.load_model(model_path, -1)  # -1 = auto select GPU
+            model.eval()
+            model.device()
+            
+            print(f"[FrameInterpolator] GMFSS模型加载成功: {model_type}")
+            return model
+            
+        except Exception as e:
+            print(f"[FrameInterpolator] GMFSS加载失败: {e}")
+            return None
+
+    def _create_gmfss_wrapper(self):
+        """创建GMFSS包装器 (当无法导入原始模型时)"""
+        # 返回None，将回退到线性插值
+        print("[FrameInterpolator] GMFSS模型定义未找到，请安装GMFSS_Fortuna")
+        return None
+
+    def _model_interpolate(self, frames: torch.Tensor, mult: int, model_data: dict) -> torch.Tensor:
+        """通用模型补帧"""
+        model = model_data.get("model")
+        if model is None:
+            return self._linear_interpolate(frames, mult)
+        
+        N = frames.shape[0]
+        frames_gpu = frames.permute(0, 3, 1, 2).to(self.device, dtype=self.dtype)
+        
+        interpolated = []
+        for i in range(N - 1):
+            f0 = frames_gpu[i:i+1]
+            f1 = frames_gpu[i+1:i+2]
+            
+            interpolated.append(f0.cpu())
+            for t in range(1, mult):
+                with torch.no_grad():
+                    mid = model(f0, f1, t / mult)
+                interpolated.append(mid.cpu())
+        
+        interpolated.append(frames_gpu[-1:].cpu())
+        
+        result = torch.cat(interpolated, dim=0)
+        result = result.permute(0, 2, 3, 1).to(torch.float32)
+        return torch.clamp(result, 0, 1)
+
     def _rife_interpolate(self, frames: torch.Tensor, mult: int) -> torch.Tensor:
-        """RIFE光流补帧"""
+        """RIFE光流补帧 (回退模式)"""
         try:
             from custom_nodes.ComfyUI_Frame_Interpolation.rife_model import RIFE
             model = RIFE().to(self.device)
@@ -704,6 +922,7 @@ NODE_CLASS_MAPPINGS = {
     "VideoCinematicProcessor": VideoCinematicProcessor,
     "VideoFrameExtractor": VideoFrameExtractor,
     "VideoFrameComposer": VideoFrameComposer,
+    "GMFSSModelLoader": GMFSSModelLoader,
     "FrameInterpolator": FrameInterpolator,
 }
 
@@ -711,5 +930,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "VideoCinematicProcessor": "🎬 Video Cinematic Processor",
     "VideoFrameExtractor": "📽️ Video Frame Extractor",
     "VideoFrameComposer": "🎥 Video Frame Composer",
+    "GMFSSModelLoader": "🔄 GMFSS Model Loader",
     "FrameInterpolator": "⏩ Frame Interpolator",
 }
